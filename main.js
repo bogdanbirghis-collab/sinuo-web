@@ -150,13 +150,17 @@
 
   /* ---------- Un solo trazo: una línea nace en el punto del titular y recorre toda la web al hacer scroll ---------- */
   function trazo() {
-    const svg = mk(document.body, 'svg', { class: 'trazo', 'aria-hidden': 'true' });
+    // la línea se pinta en franjas de una pantalla: al avanzar solo se repinta la franja donde va la punta,
+    // no un SVG de toda la página (eso es lo que hacía que la línea fuera a tirones)
+    const svg = mk(document.body, 'svg', { class: 'trazo-defs', 'aria-hidden': 'true', width: 0, height: 0 });
     const defs = mk(svg, 'defs');
-    const path = mk(defs, 'path', { id: 'tz', fill: 'none', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' });
-    const layers = mk(svg, 'g');
-    const pen = mk(svg, 'circle', { r: 0 });
-    let L = 0, cur = 0, want = 0, maxY = [], pts = [], step = 6, bands = [], ready = false, marks = [], ringT = -1;
-    const fired = new Set(), ring = mk(svg, 'circle', { fill: 'none', opacity: 0 });
+    const tilesBox = document.body.appendChild(document.createElement('div'));
+    tilesBox.className = 'trazo'; tilesBox.setAttribute('aria-hidden', 'true');
+    // la punta y la onda final van en su propia capa, que solo se desplaza
+    const PB = 300, penSvg = mk(document.body, 'svg', { class: 'trazo-pen', 'aria-hidden': 'true', width: PB, height: PB, viewBox: `0 0 ${PB} ${PB}` });
+    const pen = mk(penSvg, 'circle', { r: 0, cx: PB / 2, cy: PB / 2 });
+    let L = 0, cur = 0, want = 0, maxY = [], pts = [], step = 6, bands = [], ready = false, marks = [], ringT = -1, tiles = [];
+    const fired = new Set(), ring = mk(penSvg, 'circle', { fill: 'none', opacity: 0, cx: PB / 2, cy: PB / 2 });
 
     const hit = el => { el.classList.remove('hit'); void el.offsetWidth; el.classList.add('hit'); };
 
@@ -184,8 +188,8 @@
         const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6];
         const c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
         d += `C${c1.map(v => v.toFixed(1))} ${c2.map(v => v.toFixed(1))} ${p2.map(v => v.toFixed(1))}`;
-        for (let k = 1; k <= 32; k++) {
-          const t = k / 32, u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, e = t * t * t;
+        for (let k = 1; k <= 48; k++) {
+          const t = k / 48, u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, e = t * t * t;
           const x = a * p1[0] + b * c1[0] + c * c2[0] + e * p2[0], y = a * p1[1] + b * c1[1] + c * c2[1] + e * p2[1];
           const q = S[S.length - 1];
           S.push([x, y, q[2] + Math.hypot(x - q[0], y - q[1])]);
@@ -285,15 +289,10 @@
       $$('.step .num').forEach((el, i) => { const b = box(el); M.push(['n' + i, [b.cx, b.cy], () => hit(el)]); });
 
       const [dd, SS] = spline(P); S = SS;
-      path.setAttribute('d', dd);
-      set(svg, { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
-      svg.style.height = H + 'px';
-      path.setAttribute('stroke-width', sw);
+
       pen.setAttribute('r', sw * 1.6);
       L = S[S.length - 1][2];
-      // pathLength hace que el guion use nuestra longitud aunque el navegador mida un poco distinto
-      path.setAttribute('pathLength', L);
-      path.setAttribute('stroke-dasharray', `${L} ${L + 10}`);
+
       maxY = []; let m = -1e9;
       pts = [];
       for (let l = 0; l <= L; l += step) { const q = at(l); pts.push(q); m = max(m, q.y); maxY.push(m); }
@@ -303,14 +302,31 @@
       marks.push({ key: 'end', len: L - step, fn: () => { ringT = performance.now(); } });
 
       // un color por sección: azul sobre arena, azul claro sobre negro, arena sobre azul
-      layers.replaceChildren(); defs.querySelectorAll('clipPath').forEach(c => c.remove());
+      defs.querySelectorAll('clipPath').forEach(c => c.remove());
       bands = $$('main > section, main > .ticker, .site-footer').map((el, i) => {
         const b = box(el), col = el.classList.contains('blue') ? '#F3EFE7' : (el.classList.contains('dark') || el.classList.contains('ticker')) ? '#6B78FF' : '#2B3BFF';
         const cp = mk(defs, 'clipPath', { id: 'tzc' + i });
         mk(cp, 'rect', { x: 0, y: b.t, width: W, height: b.h });
-        mk(layers, 'use', { href: '#tz', stroke: col, 'clip-path': `url(#tzc${i})` });
-        return { t: b.t, b: b.b, col };
+        return { t: b.t, b: b.b, col, i };
       });
+      // franjas: cada una sabe qué tramo de la línea contiene, para no tocarla mientras la punta está lejos
+      tilesBox.replaceChildren(); tiles = [];
+      const th = max(600, innerHeight), tp = sw * 2;
+      for (let ty = 0; ty < H; ty += th) {
+        const h = min(th, H - ty);
+        let l0 = Infinity, l1 = -Infinity;
+        for (const q of S) if (q[1] >= ty - tp && q[1] <= ty + h + tp) { l0 = min(l0, q[2]); l1 = max(l1, q[2]); }
+        if (l0 > l1) continue;
+        // cada franja lleva solo su tramo de línea (la polilínea muestreada), así repintarla cuesta poco
+        const seg = S.filter(q => q[2] >= l0 && q[2] <= l1), a0 = seg[0][2], len = seg[seg.length - 1][2] - a0;
+        const d = 'M' + seg.map(q => q[0].toFixed(1) + ',' + q[1].toFixed(1)).join('L');
+        const t = mk(tilesBox, 'svg', { width: W, height: h, viewBox: `0 ${ty} ${W} ${h}` });
+        t.style.top = ty + 'px';
+        const g = mk(t, 'g', { fill: 'none', 'stroke-width': sw, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+          'stroke-dasharray': `${len + 1} ${len + 10}`, 'stroke-dashoffset': len + 1 });
+        for (const b of bands) if (b.b > ty && b.t < ty + h) mk(g, 'path', { d, pathLength: len, stroke: b.col, 'clip-path': `url(#tzc${b.i})` });
+        tiles.push({ g, a0, len, v: len + 1 });
+      }
       ready = true;
       if (reduce) cur = want = L;
       draw();
@@ -323,9 +339,13 @@
       return min(L, lo * step);
     };
     function draw() {
-      path.setAttribute('stroke-dashoffset', L - cur);
+      for (const t of tiles) {
+        const v = cur <= t.a0 ? t.len + 1 : cur >= t.a0 + t.len ? 0 : +(t.len - (cur - t.a0)).toFixed(1);
+        if (v !== t.v) { t.g.setAttribute('stroke-dashoffset', v); t.v = v; }
+      }
       const p = at(cur), b = bands.find(b => p.y >= b.t && p.y < b.b);
-      set(pen, { cx: p.x, cy: p.y, fill: b ? b.col : '#2B3BFF' });
+      penSvg.style.transform = `translate(${(p.x - PB / 2).toFixed(1)}px,${(p.y - PB / 2).toFixed(1)}px)`;
+      pen.setAttribute('fill', b ? b.col : '#2B3BFF');
     }
     // el titular entra rebotando: se recalcula cuando ya está quieto y luego empieza a dibujar
     let t0 = performance.now() + 1350;
@@ -338,8 +358,8 @@
         for (const mm of marks) if (cur >= mm.len - 1 && !fired.has(mm.key)) { fired.add(mm.key); mm.fn(); }
         // al terminar, el punto final suelta una onda como el punto del logo
         if (ringT > 0) {
-          const u = (now - ringT) / 900, p = at(L), w = +pen.getAttribute('r');
-          set(ring, { cx: p.x, cy: p.y, r: w + eo(u) * w * 9, opacity: cl(1 - u), 'stroke-width': w * (1 - eo(u)) + 1, stroke: pen.getAttribute('fill') });
+          const u = (now - ringT) / 900, w = +pen.getAttribute('r');
+          set(ring, { r: w + eo(u) * w * 9, opacity: cl(1 - u), 'stroke-width': w * (1 - eo(u)) + 1, stroke: pen.getAttribute('fill') });
           if (u > 1) ringT = -1;
         }
       }
