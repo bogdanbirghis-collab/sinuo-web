@@ -174,20 +174,41 @@
       return { l: min(...line.map(q => q.left)), r: max(...line.map(q => q.right)), b: last.bottom + s, h: last.height };
     };
     // Catmull-Rom → curvas de Bézier que pasan por todos los puntos
+    // también devuelve la curva muestreada (x, y y longitud acumulada) para no pedírsela al navegador,
+    // que con getPointAtLength sobre un trazo tan largo bloqueaba la página varios segundos
     const spline = P => {
       let d = `M${P[0][0].toFixed(1)},${P[0][1].toFixed(1)}`;
+      const S = [[P[0][0], P[0][1], 0]];
       for (let i = 0; i < P.length - 1; i++) {
         const p0 = P[i - 1] || P[i], p1 = P[i], p2 = P[i + 1], p3 = P[i + 2] || p2;
         const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6];
         const c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
         d += `C${c1.map(v => v.toFixed(1))} ${c2.map(v => v.toFixed(1))} ${p2.map(v => v.toFixed(1))}`;
+        for (let k = 1; k <= 32; k++) {
+          const t = k / 32, u = 1 - t, a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, e = t * t * t;
+          const x = a * p1[0] + b * c1[0] + c * c2[0] + e * p2[0], y = a * p1[1] + b * c1[1] + c * c2[1] + e * p2[1];
+          const q = S[S.length - 1];
+          S.push([x, y, q[2] + Math.hypot(x - q[0], y - q[1])]);
+        }
       }
-      return d;
+      return [d, S];
     };
+    // punto del trazo a una longitud dada, sobre la curva muestreada
+    let S = [];
+    const at = l => {
+      let lo = 0, hi = S.length - 1;
+      while (lo < hi) { const k = (lo + hi) >> 1; S[k][2] < l ? lo = k + 1 : hi = k; }
+      const q = S[lo], o = S[lo - 1] || q, f = q[2] > o[2] ? (l - o[2]) / (q[2] - o[2]) : 0;
+      return { x: o[0] + (q[0] - o[0]) * f, y: o[1] + (q[1] - o[1]) * f };
+    };
+    let lastW = 0, lastH = 0;
 
-    function build() {
+    function build(force) {
       const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
       const W = document.documentElement.clientWidth, H = box($('.site-footer')).b;
+      // nada ha cambiado de tamaño: no hace falta rehacer el trazo
+      if (!force && ready && W === lastW && abs(H - lastH) < 2) return;
+      lastW = W; lastH = H;
       const wrap = $('#trabajos .wrap'), pad = parseFloat(getComputedStyle(wrap).paddingLeft), wb = wrap.getBoundingClientRect();
       const cL = wb.left + pad, cR = wb.right - pad;
       const xL = cL / 2, xR = (cR + W) / 2, amp = min(cL * .3, 34);
@@ -263,16 +284,19 @@
       const M = [['dot', [x0, y0], () => hit($('.hero h1 .dot'))]];
       $$('.step .num').forEach((el, i) => { const b = box(el); M.push(['n' + i, [b.cx, b.cy], () => hit(el)]); });
 
-      path.setAttribute('d', spline(P));
+      const [dd, SS] = spline(P); S = SS;
+      path.setAttribute('d', dd);
       set(svg, { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
       svg.style.height = H + 'px';
       path.setAttribute('stroke-width', sw);
       pen.setAttribute('r', sw * 1.6);
-      L = path.getTotalLength();
+      L = S[S.length - 1][2];
+      // pathLength hace que el guion use nuestra longitud aunque el navegador mida un poco distinto
+      path.setAttribute('pathLength', L);
       path.setAttribute('stroke-dasharray', `${L} ${L + 10}`);
       maxY = []; let m = -1e9;
       pts = [];
-      for (let l = 0; l <= L; l += step) { const q = path.getPointAtLength(l); pts.push(q); m = max(m, q.y); maxY.push(m); }
+      for (let l = 0; l <= L; l += step) { const q = at(l); pts.push(q); m = max(m, q.y); maxY.push(m); }
       const atY = y => { let lo = 0, hi = maxY.length - 1; while (lo < hi) { const k = (lo + hi) >> 1; maxY[k] < y ? lo = k + 1 : hi = k; } return lo * step; };
       const near = ([x, y]) => { let bi = 0, bd = 1e12; pts.forEach((q, i) => { const dd = (q.x - x) ** 2 + (q.y - y) ** 2; if (dd < bd) { bd = dd; bi = i; } }); return bi * step; };
       marks = M.map(([key, at, fn]) => ({ key, fn, len: key === 'dot' ? 0 : Array.isArray(at) ? near(at) : atY(at) }));
@@ -300,12 +324,12 @@
     };
     function draw() {
       path.setAttribute('stroke-dashoffset', L - cur);
-      const p = path.getPointAtLength(cur), b = bands.find(b => p.y >= b.t && p.y < b.b);
+      const p = at(cur), b = bands.find(b => p.y >= b.t && p.y < b.b);
       set(pen, { cx: p.x, cy: p.y, fill: b ? b.col : '#2B3BFF' });
     }
     // el titular entra rebotando: se recalcula cuando ya está quieto y luego empieza a dibujar
     let t0 = performance.now() + 1350;
-    setTimeout(() => build(), 1300);
+    setTimeout(() => build(true), 1300);
     if (!reduce) requestAnimationFrame(function tick(now) {
       if (ready && now > t0) {
         want = target();
@@ -314,7 +338,7 @@
         for (const mm of marks) if (cur >= mm.len - 1 && !fired.has(mm.key)) { fired.add(mm.key); mm.fn(); }
         // al terminar, el punto final suelta una onda como el punto del logo
         if (ringT > 0) {
-          const u = (now - ringT) / 900, p = path.getPointAtLength(L), w = +pen.getAttribute('r');
+          const u = (now - ringT) / 900, p = at(L), w = +pen.getAttribute('r');
           set(ring, { cx: p.x, cy: p.y, r: w + eo(u) * w * 9, opacity: cl(1 - u), 'stroke-width': w * (1 - eo(u)) + 1, stroke: pen.getAttribute('fill') });
           if (u > 1) ringT = -1;
         }
@@ -322,7 +346,7 @@
       requestAnimationFrame(tick);
     });
     let rt; const rebuild = () => { clearTimeout(rt); rt = setTimeout(build, 150); };
-    addEventListener('resize', rebuild);
+    addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => build(true), 150); });
     new ResizeObserver(rebuild).observe(document.querySelector('main'));
     addEventListener('load', rebuild);
     build();
