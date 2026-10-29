@@ -224,7 +224,7 @@
 
       // Servicios: de derecha a izquierda y baja por la izquierda
       sweep($('#servicios'), xR, xL);
-      const sv = box($('.services'));
+      const sv = box($('.services-block'));
       lane(xL, sv.t, sv.b, -1);
 
       // Proceso: baja por la izquierda y pasa por los cuatro números como cuentas de un collar
